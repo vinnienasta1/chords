@@ -1,0 +1,311 @@
+<?php
+require_once __DIR__ . '/security.php';
+require_once __DIR__ . '/db.php';
+ensure_session_started();
+DB::init();
+
+if (!isset($_SESSION['authenticated']) || $_SESSION['authenticated'] !== true) {
+    $redirect = $_SERVER['REQUEST_URI'];
+    header('Location: /auth.php?redirect=' . urlencode($redirect));
+    exit;
+}
+
+$username = $_SESSION['username'] ?? 'Гость';
+$initial = strtoupper(substr($username, 0, 1) ?: 'G');
+
+$db = DB::getConnection();
+$stmt = $db->prepare('SELECT is_admin FROM users WHERE username = ?');
+$stmt->execute([$username]);
+$user = $stmt->fetch();
+$isAdmin = $user && $user['is_admin'] == 1;
+?>
+<!DOCTYPE html>
+<html lang='ru'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>Vinnie chords — Коллекция песен и аккордов</title>
+    <link rel="stylesheet" href="/common.css">
+    <style>
+        :root {
+            --bg: #0f172a;
+            --panel: #0b1224;
+            --accent: #667eea;
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: 'Inter', Arial, sans-serif;
+            background: linear-gradient(135deg, #0f172a 0%, #111827 60%, #0b1224 100%);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        .layout {
+            display: grid;
+            grid-template-columns: 260px 1fr;
+            min-height: 100vh;
+        }
+        .sidebar {
+            background: var(--panel);
+            padding: 1.2rem;
+            border-right: 1px solid rgba(255,255,255,0.06);
+            position: sticky;
+            top: 0;
+            align-self: start;
+            height: 100vh;
+            overflow: auto;
+        }
+        .brand {
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: var(--text);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .nav {
+            display: grid;
+            gap: 0.4rem;
+        }
+        .nav a {
+            display: block;
+            padding: 0.75rem 0.9rem;
+            border-radius: 10px;
+            color: var(--text);
+            text-decoration: none;
+            background: rgba(255,255,255,0.04);
+            transition: 0.2s;
+        }
+        .nav a:hover { background: rgba(102,126,234,0.15); }
+        .nav a.active {
+            background: rgba(102,126,234,0.28);
+            border: 1px solid rgba(102,126,234,0.5);
+            box-shadow: 0 6px 16px rgba(102,126,234,0.2);
+        }
+        .nav a.disabled { opacity: 0.4; pointer-events: none; }
+        .content { padding: 1.5rem 2rem; }
+        .topbar {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .user-pill {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: var(--accent);
+            color: #fff;
+            display: grid;
+            place-items: center;
+            font-weight: 700;
+            text-transform: uppercase;
+            cursor: pointer;
+        }
+        .user-menu { position:absolute; right:0; top:46px; background:var(--panel); border:1px solid rgba(255,255,255,0.12); border-radius:10px; box-shadow:0 10px 24px rgba(0,0,0,0.35); padding:0.3rem 0; display:none; min-width:180px; z-index:20; }
+        .user-menu a { display:block; padding:0.6rem 0.9rem; color:var(--text); text-decoration:none; }
+        .user-menu a:hover { background:rgba(255,255,255,0.06); }
+        .card {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.06);
+            border-radius: 14px;
+            padding: 1.8rem;
+            max-width: 720px;
+        }
+        h1 {
+            margin: 0 0 0.5rem;
+            font-size: 2.2rem;
+        }
+        p {
+            margin: 0.4rem 0 0;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+        .links {
+            margin-top: 1.2rem;
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 0.7rem 1.2rem;
+            border-radius: 10px;
+            background: var(--accent);
+            color: #fff;
+            text-decoration: none;
+            font-weight: 600;
+            transition: 0.2s;
+            border: none;
+        }
+        .btn.outline { background: transparent; border: 1px solid rgba(255,255,255,0.2); }
+        .btn:hover { opacity: 0.9; }
+        .features-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        .features-list li {
+            padding: 0.4rem 0;
+            padding-left: 1.5rem;
+            position: relative;
+            color: var(--muted);
+            line-height: 1.8;
+        }
+        .features-list li::before {
+            content: "→";
+            position: absolute;
+            left: 0;
+            color: var(--accent);
+            font-weight: bold;
+        }
+        @media (max-width: 960px) {
+            .layout { grid-template-columns: 1fr; }
+            .sidebar {
+                position: fixed;
+                inset: 0 auto 0 0;
+                width: 240px;
+                transform: translateX(-260px);
+                transition: transform 0.2s ease;
+                z-index: 10;
+            }
+            .sidebar.open { transform: translateX(0); }
+            .content { padding: 1rem; }
+            .toggle {
+                position: fixed;
+                top: 12px;
+                left: 12px;
+                z-index: 11;
+                padding: 0.6rem 0.9rem;
+                border-radius: 10px;
+                border: 1px solid rgba(255,255,255,0.2);
+                background: rgba(0,0,0,0.4);
+                color: #fff;
+                cursor: pointer;
+                font-size: 1.2rem;
+                min-width: 44px;
+                min-height: 44px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .topbar {
+                margin-top: 3rem;
+            }
+            .card {
+                padding: 1.2rem;
+            }
+            h1 {
+                font-size: 1.75rem;
+            }
+            .links {
+                flex-direction: column;
+            }
+            .links .btn {
+                width: 100%;
+                text-align: center;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .content { padding: 0.75rem; }
+            .card {
+                padding: 1rem;
+            }
+            h1 {
+                font-size: 1.5rem;
+            }
+            .toggle {
+                top: 8px;
+                left: 8px;
+                padding: 0.5rem 0.75rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="layout">
+        <div class="backdrop" id="backdrop"></div>
+        <aside class="sidebar" id="sidebar">
+            <div class="brand">Vinnie chords</div>
+            <nav class="nav">
+                <a href="/" class="active">Главная</a>
+                <?php if ($isAdmin): ?><a href="/admin.php">Админка</a><?php endif; ?>
+                <a href="/songs.php">Все песни</a>
+                <a href="/setlists.php">Сет листы</a>
+                <a href="/logout.php">Выйти</a>
+            </nav>
+        </aside>
+        <main class="content">
+            <div class="topbar">
+                <div class="user-pill" id="user-pill"><?php echo htmlspecialchars($initial); ?></div>
+                <div class="user-menu" id="user-menu">
+                    <?php if ($isAdmin): ?>
+                        <a href="#">Мой профиль</a>
+                        <a href="/admin.php" onclick="return true;">Сменить пароль</a>
+                    <?php endif; ?>
+                    <a href="/logout.php">Выйти</a>
+                </div>
+            </div>
+            <div class="card">
+                <h1>Vinnie chords</h1>
+                <p style="font-size: 1.1rem; margin-top: 0.8rem; line-height: 1.7;">
+                    Коллекция песен с аккордами для гитары. Система для хранения, поиска и организации репертуара.
+                </p>
+                
+                <div style="margin-top: 1.5rem; padding-top: 1.5rem; border-top: 1px solid rgba(255,255,255,0.1);">
+                    <h2 style="font-size: 1.3rem; margin: 0 0 0.8rem; color: var(--text);">Возможности:</h2>
+                    <ul class="features-list">
+                        <li>Просмотр песен с аккордами и текстами</li>
+                        <li>Транспонирование аккордов для удобной тональности</li>
+                        <li>Автопрокрутка при исполнении песен</li>
+                        <li>Создание и управление сет-листами для концертов</li>
+                        <li>Поиск и фильтрация по названию, исполнителю, сложности</li>
+                        <li>Настройка отображения: размер шрифта, стиль аккордов, двухколоночный режим</li>
+                    </ul>
+                </div>
+                
+               
+                <div class="links">
+                    <a href="/songs.php" class="btn">Песни и аккорды</a>
+                    <a href="/setlists.php" class="btn outline">Сет-листы</a>
+                    <?php if ($isAdmin): ?>
+                        <a href="/admin.php" class="btn outline">Админка</a>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+        const sidebar = document.getElementById('sidebar');
+        if (sidebar) {
+            const backdrop = document.getElementById('backdrop');
+            const btn = document.createElement('button');
+            btn.className = 'toggle';
+            btn.textContent = '≡';
+            const close = () => { sidebar.classList.remove('open'); backdrop?.classList.remove('show'); };
+            btn.addEventListener('click', () => { sidebar.classList.toggle('open'); backdrop?.classList.toggle('show'); });
+            backdrop?.addEventListener('click', close);
+            document.body.appendChild(btn);
+            document.addEventListener('click', (e) => {
+                if (!sidebar.contains(e.target) && !btn.contains(e.target)) {
+                    close();
+                }
+            });
+        }
+        const userPill = document.getElementById('user-pill');
+        const userMenu = document.getElementById('user-menu');
+        if (userPill && userMenu) {
+            userPill.addEventListener('click', (e) => {
+                e.stopPropagation();
+                userMenu.style.display = userMenu.style.display === 'block' ? 'none' : 'block';
+            });
+            document.addEventListener('click', (e) => {
+                if (!userMenu.contains(e.target) && e.target !== userPill) userMenu.style.display = 'none';
+            });
+        }
+    </script>
+</body>
+</html>

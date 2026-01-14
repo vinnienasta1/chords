@@ -1,0 +1,219 @@
+/* Стили общих компонентов интерфейса */
+
+/* Layout */
+body {
+    margin: 0;
+    font-family: 'Inter', Arial, sans-serif;
+    height: 100vh;
+    overflow: hidden;
+}
+
+.layout {
+    display: block;
+    height: 100vh;
+    overflow-y: auto;
+}
+
+/* Sidebar */
+.sidebar {
+    background: var(--panel);
+    padding: 1.2rem;
+    border-right: 1px solid rgba(255,255,255,0.06);
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 260px;
+    overflow: auto;
+    z-index: 3000;
+    display: flex;
+    flex-direction: column;
+}
+
+/* User Block */
+.user-block {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.3rem;
+    margin-bottom: 1.2rem;
+}
+
+.user-pill {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    display: grid;
+    place-items: center;
+    font-weight: 700;
+    text-transform: uppercase;
+    cursor: pointer;
+    overflow: hidden;
+    transition: transform 0.2s ease;
+}
+
+.user-pill:hover {
+    transform: scale(1.05);
+}
+
+.user-pill img.user-avatar {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.user-name {
+    font-size: 0.9rem;
+    color: var(--muted);
+    text-align: center;
+    max-width: 100%;
+    word-break: break-word;
+}
+
+.user-menu {
+    margin-top: 0.3rem;
+    width: 100%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    padding: 0.3rem 0;
+    display: none;
+}
+
+.user-menu a {
+    display: block;
+    padding: 0.6rem 0.9rem;
+    color: var(--text);
+    text-decoration: none;
+    transition: background 0.15s ease;
+}
+
+.user-menu a:hover {
+    background: rgba(var(--accent-rgb, 102, 126, 234), 0.1);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+/* Navigation */
+.nav {
+    display: grid;
+    gap: 0.4rem;
+}
+
+.nav a {
+    display: block;
+    padding: 0.75rem 0.9rem;
+    border-radius: 10px;
+    color: var(--text);
+    text-decoration: none;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    transition: 0.2s;
+}
+
+.nav a:hover {
+    background: rgba(var(--accent-rgb, 102, 126, 234), 0.15);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.nav a.active {
+    background: rgba(var(--accent-rgb, 102, 126, 234), 0.28);
+    background: color-mix(in srgb, var(--accent) 28%, transparent);
+    border: 1px solid rgba(var(--accent-rgb, 102, 126, 234), 0.5);
+    border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+    box-shadow: 0 6px 16px rgba(var(--accent-rgb, 102, 126, 234), 0.2);
+    box-shadow: 0 6px 16px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.nav a.disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+
+/* Content Area */
+.content {
+    padding: 1.5rem 2rem;
+    margin-left: 260px;
+}
+
+/* Backdrop для мобильного меню */
+.backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.45);
+    opacity: 0;
+    visibility: hidden;
+    transition: 0.2s ease;
+    z-index: 2999;
+}
+
+.backdrop.show {
+    opacity: 1;
+    visibility: visible;
+}
+
+/* Toggle кнопка для мобильного меню */
+.toggle {
+    position: fixed;
+    top: 10px;
+    left: 10px;
+    z-index: 3001;
+    padding: 0.55rem 0.85rem;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--panel) 90%, transparent);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 1.1rem;
+    min-width: 40px;
+    min-height: 40px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(4px);
+    box-shadow: var(--shadow);
+}
+
+/* Мобильная адаптация */
+@media (max-width: 960px) {
+    .layout {
+        display: block;
+    }
+    
+    .content {
+        margin-left: 0;
+        padding: 0.85rem 0.9rem 1rem;
+    }
+    
+    .sidebar {
+        position: fixed;
+        inset: 0 auto 0 0;
+        width: 240px;
+        transform: translateX(-260px);
+        transition: transform 0.2s ease;
+        z-index: 3000;
+    }
+    
+    .sidebar.open {
+        transform: translateX(0);
+    }
+    
+    .toggle {
+        display: flex;
+    }
+}
+
+@media (max-width: 480px) {
+    .content {
+        padding: 0.75rem;
+    }
+    
+    .toggle {
+        top: 8px;
+        left: 8px;
+        padding: 0.5rem 0.75rem;
+    }
+}

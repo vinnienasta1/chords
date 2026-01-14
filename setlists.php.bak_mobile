@@ -1,0 +1,338 @@
+<?php
+require_once __DIR__ . '/security.php';
+require_once __DIR__ . '/db.php';
+ensure_session_started();
+DB::init();
+
+if (!isset($_SESSION['authenticated']) || $_SESSION['authenticated'] !== true) {
+    header('Location: /auth.php?redirect=' . urlencode('/setlists.php'));
+    exit;
+}
+
+$username = $_SESSION['username'] ?? 'Гость';
+$initial = strtoupper(substr($username, 0, 1) ?: 'G');
+$db = DB::getConnection();
+$stmt = $db->prepare("SELECT is_admin FROM users WHERE username = ?");
+$stmt->execute([$username]);
+$row = $stmt->fetch();
+$isAdmin = $row && (int)$row['is_admin'] === 1;
+$csrf = csrf_token();
+
+// CRUD
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_csrf();
+    if (!$isAdmin) { header('Location: /setlists.php'); exit; }
+    $action = $_POST['action'] ?? '';
+    if ($action === 'create') {
+        $name = trim($_POST['name'] ?? '');
+        if ($name !== '') {
+            $stmt = $db->prepare("INSERT INTO setlists(name) VALUES(?)");
+            $stmt->execute([$name]);
+            $newId = $db->lastInsertId();
+            header('Location: /setlist_view.php?id=' . $newId . '&mode=edit');
+            exit;
+        }
+    } elseif ($action === 'delete') {
+        $id = (int)($_POST['id'] ?? 0);
+        if ($id > 0) {
+            $stmt = $db->prepare("DELETE FROM setlists WHERE id = ?");
+            $stmt->execute([$id]);
+        }
+    } elseif ($action === 'rename') {
+        $id = (int)($_POST['id'] ?? 0);
+        $name = trim($_POST['name'] ?? '');
+        if ($id > 0 && $name !== '') {
+            $stmt = $db->prepare("UPDATE setlists SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?");
+            $stmt->execute([$name, $id]);
+            echo json_encode(['ok' => true]);
+            exit;
+        }
+        echo json_encode(['ok' => false]);
+        exit;
+    }
+    header('Location: /setlists.php');
+    exit;
+}
+
+$setlists = $db->query("SELECT * FROM setlists ORDER BY created_at DESC")->fetchAll();
+?>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Сет листы</title>
+    <link rel="stylesheet" href="/common.css">
+    <style>
+        :root { --bg:#0f172a; --panel:#0b1224; --accent:#667eea; --text:#e2e8f0; --muted:#94a3b8; }
+        * { box-sizing:border-box; }
+        body { margin:0; font-family:'Inter',Arial,sans-serif; background:linear-gradient(135deg,#0f172a 0%,#111827 60%,#0b1224 100%); color:var(--text); min-height:100vh; }
+        .layout { display:block; min-height:100vh; }
+        .sidebar { background:var(--panel); padding:1.2rem; border-right:1px solid rgba(255,255,255,0.06); position:fixed; top:0; left:0; bottom:0; width:260px; overflow:auto; }
+        .brand { font-weight:700; letter-spacing:0.5px; color:var(--text); margin-bottom:1rem; display:flex; align-items:center; gap:0.5rem; }
+        .nav { display:grid; gap:0.4rem; }
+        .nav a { display:block; padding:0.75rem 0.9rem; border-radius:10px; color:var(--text); text-decoration:none; background:rgba(255,255,255,0.04); transition:0.2s; }
+        .nav a:hover { background:rgba(102,126,234,0.15); }
+        .nav a.active { background:rgba(102,126,234,0.28); border:1px solid rgba(102,126,234,0.5); box-shadow:0 6px 16px rgba(102,126,234,0.2); }
+        .content { padding:1.5rem 2rem; margin-left:260px; }
+        .topbar { display:flex; justify-content:flex-end; align-items:center; margin-bottom:1rem; position:relative; }
+        .user-pill { width:36px; height:36px; border-radius:50%; background:var(--accent); color:#fff; display:grid; place-items:center; font-weight:700; text-transform:uppercase; cursor:pointer; }
+        .user-menu { position:absolute; right:0; top:46px; background:var(--panel); border:1px solid rgba(255,255,255,0.12); border-radius:10px; box-shadow:0 10px 24px rgba(0,0,0,0.35); padding:0.3rem 0; display:none; min-width:180px; z-index:20; }
+        .user-menu a { display:block; padding:0.6rem 0.9rem; color:var(--text); text-decoration:none; }
+        .user-menu a:hover { background:rgba(255,255,255,0.06); }
+        .card { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.06); border-radius:14px; padding:1.4rem; margin-bottom:1rem; }
+        h1 { margin:0 0 0.5rem; }
+        .list { display:grid; gap:0.6rem; }
+        .item { padding:0.9rem; border-radius:12px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); display:flex; justify-content:space-between; align-items:center; color:var(--text); width:100%; gap:0.75rem; cursor:pointer; }
+        .item-name { font-weight:700; cursor:pointer; color:var(--text); }
+        .actions { display:flex; gap:0.5rem; }
+        .btn { padding:0.5rem 0.9rem; border-radius:10px; border:none; cursor:pointer; font-weight:600; }
+        .btn.primary { background:var(--accent); color:#fff; }
+        .btn.danger { background:#dc3545; color:#fff; }
+        .btn.ghost { background:transparent; border:1px solid rgba(255,255,255,0.3); color:var(--text); }
+        .input { width:100%; padding:0.7rem; border-radius:10px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.04); color:var(--text); }
+        .toast-container { position:fixed; right:16px; bottom:16px; display:grid; gap:8px; z-index:2000; }
+        .toast { min-width:200px; max-width:320px; background:#0b1224; color:#e2e8f0; border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:10px 12px; box-shadow:0 8px 24px rgba(0,0,0,0.25); font-size:0.95rem; }
+        .toast.success { border-color: rgba(46,204,113,0.5); }
+        .toast.error { border-color: rgba(231,76,60,0.5); }
+        .toast .actions { margin-top:8px; display:flex; gap:8px; justify-content:flex-end; }
+        .toast .btn-small { padding:0.35rem 0.7rem; border-radius:8px; border:none; cursor:pointer; font-weight:600; }
+        .toast .btn-small.confirm { background:var(--accent); color:#fff; }
+        .toast .btn-small.cancel { background:#4b5563; color:#fff; }
+        @media (max-width:960px) {
+            .layout { display:block; }
+            .sidebar {
+                position:fixed;
+                inset:0 auto 0 0;
+                width:240px;
+                transform:translateX(-260px);
+                transition:transform 0.2s ease;
+                z-index:10;
+            }
+            .sidebar.open { transform:translateX(0); }
+            .content { padding:1rem; margin-left:0; }
+            .toggle {
+                position:fixed;
+                top:12px;
+                left:12px;
+                z-index:11;
+                padding:0.6rem 0.9rem;
+                border-radius:10px;
+                border:1px solid rgba(255,255,255,0.2);
+                background:rgba(0,0,0,0.4);
+                color:#fff;
+                cursor:pointer;
+                font-size: 1.2rem;
+                min-width: 44px;
+                min-height: 44px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .topbar {
+                margin-top: 3rem;
+            }
+            .card {
+                padding: 1.2rem;
+            }
+            h1 {
+                font-size: 1.75rem;
+            }
+            .item {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0.75rem;
+            }
+            .item-name {
+                width: 100%;
+            }
+            .actions {
+                width: 100%;
+                flex-wrap: wrap;
+            }
+            .actions .btn {
+                flex: 1;
+                min-width: 120px;
+            }
+            form[style*="display:flex"] {
+                flex-direction: column;
+            }
+            form[style*="display:flex"] > * {
+                width: 100%;
+            }
+            .input {
+                font-size: 16px;
+            }
+            .toast-container {
+                right: 8px;
+                left: 8px;
+                bottom: 8px;
+            }
+            .toast {
+                max-width: 100%;
+            }
+        }
+        
+        @media (max-width: 480px) {
+            .content { padding: 0.75rem; }
+            .card {
+                padding: 1rem;
+            }
+            h1 {
+                font-size: 1.5rem;
+            }
+            .toggle {
+                top: 8px;
+                left: 8px;
+                padding: 0.5rem 0.75rem;
+            }
+            .item {
+                padding: 0.75rem;
+            }
+            .actions .btn {
+                width: 100%;
+                min-width: unset;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="layout">
+        <div class="backdrop" id="backdrop"></div>
+        <aside class="sidebar" id="sidebar">
+            <div class="brand">Vinnie chords</div>
+            <nav class="nav">
+                <a href="/">Главная</a>
+                <?php if ($isAdmin): ?><a href="/admin.php">Админка</a><?php endif; ?>
+                <a href="/songs.php">Все песни</a>
+                <a href="/setlists.php" class="active">Сет листы</a>
+                <a href="/logout.php">Выйти</a>
+            </nav>
+        </aside>
+        <main class="content">
+            <div class="topbar">
+                <div class="user-pill" id="user-pill"><?php echo htmlspecialchars($initial); ?></div>
+                <div class="user-menu" id="user-menu">
+                    <?php if ($isAdmin): ?>
+                        <a href="#">Мой профиль</a>
+                        <a href="/admin.php" onclick="showTab('users', event)">Сменить пароль</a>
+                    <?php endif; ?>
+                    <a href="/logout.php">Выйти</a>
+                </div>
+            </div>
+            <div class="card">
+                <h1>Сет листы</h1>
+                <?php if ($isAdmin): ?>
+                <form method="POST" style="margin-bottom:1rem; display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+                    <input type="hidden" name="action" value="create">
+                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrf); ?>">
+                    <input class="input" name="name" placeholder="Название сет-листа" required style="flex:1; min-width:260px; margin:0;">
+                    <button class="btn primary" type="submit">Создать</button>
+                </form>
+                <?php endif; ?>
+                <div class="list">
+                    <?php if (empty($setlists)): ?>
+                        <div class="item"><span class="item-name">Нет сет-листов</span></div>
+                    <?php else: foreach ($setlists as $sl): ?>
+                        <div class="item" data-id="<?php echo $sl['id']; ?>" data-link="/setlist_view.php?id=<?php echo $sl['id']; ?>&mode=view">
+                            <span class="item-name" data-editable="1"><?php echo htmlspecialchars($sl['name']); ?></span>
+                            <div class="actions" style="display:flex; gap:0.5rem; align-items:center;">
+                                <?php if ($isAdmin): ?><a class="btn ghost" style="text-decoration:none;" href="/setlist_view.php?id=<?php echo $sl['id']; ?>&mode=edit">Редактировать</a><?php endif; ?>
+                                <?php if ($isAdmin): ?>
+                                <form method="POST" data-confirm="Удалить сетлист?">
+                                    <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrf); ?>">
+                                    <input type="hidden" name="action" value="delete">
+                                    <input type="hidden" name="id" value="<?php echo $sl['id']; ?>">
+                                    <button class="btn danger" type="submit">Удалить</button>
+                                </form>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                    <?php endforeach; endif; ?>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script>
+        const sidebar = document.getElementById('sidebar');
+        if (sidebar) {
+            const backdrop = document.getElementById('backdrop');
+            const btn = document.createElement('button'); btn.className = 'toggle'; btn.textContent = '≡';
+            const close = () => { sidebar.classList.remove('open'); backdrop?.classList.remove('show'); };
+            btn.addEventListener('click', () => { sidebar.classList.toggle('open'); backdrop?.classList.toggle('show'); });
+            backdrop?.addEventListener('click', close);
+            document.body.appendChild(btn);
+            document.addEventListener('click', (e) => { if (!sidebar.contains(e.target) && !btn.contains(e.target)) { close(); } });
+        }
+        const csrfToken = '<?php echo htmlspecialchars($csrf); ?>';
+        document.querySelectorAll('[data-editable="1"]').forEach(el => {
+            el.addEventListener('dblclick', () => {
+                if (!<?php echo $isAdmin ? 'true':'false'; ?>) return;
+                const id = el.closest('.item').dataset.id;
+                const val = prompt('Новое название:', el.textContent.trim());
+                if (!val) return;
+                fetch('/setlists.php', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({ action: 'rename', id, name: val, csrf_token: csrfToken })
+                }).then(r => r.json()).then(() => { el.textContent = val; });
+            });
+        });
+        document.querySelectorAll('.item').forEach(el => {
+            el.addEventListener('click', (e) => {
+                if (e.target.closest('form') || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                const link = el.dataset.link;
+                if (link) window.location.href = link;
+            });
+        });
+        const userPill = document.getElementById('user-pill');
+        const userMenu = document.getElementById('user-menu');
+        if (userPill && userMenu) {
+            userPill.addEventListener('click', (e) => {
+                e.stopPropagation();
+                userMenu.style.display = userMenu.style.display === 'block' ? 'none' : 'block';
+            });
+            document.addEventListener('click', (e) => {
+                if (!userMenu.contains(e.target) && e.target !== userPill) userMenu.style.display = 'none';
+            });
+        }
+        // Toasts & confirm
+        (function() {
+            let container = document.querySelector('.toast-container');
+            if (!container) {
+                container = document.createElement('div');
+                container.className = 'toast-container';
+                document.body.appendChild(container);
+            }
+            window.showToast = function(message, type = 'success', duration = 3000) {
+                const toast = document.createElement('div');
+                toast.className = `toast ${type}`;
+                toast.textContent = message;
+                container.appendChild(toast);
+                setTimeout(() => toast.remove(), duration);
+            };
+            window.showConfirm = function(message, onConfirm) {
+                const toast = document.createElement('div');
+                toast.className = 'toast';
+                toast.innerHTML = `<div>${message}</div><div class="actions"><button class="btn-small cancel">Отмена</button><button class="btn-small confirm">Ок</button></div>`;
+                container.appendChild(toast);
+                const close = () => toast.remove();
+                toast.querySelector('.cancel').addEventListener('click', close);
+                toast.querySelector('.confirm').addEventListener('click', () => { close(); onConfirm && onConfirm(); });
+            };
+            document.querySelectorAll('form[data-confirm]').forEach(form => {
+                const msg = form.getAttribute('data-confirm');
+                form.addEventListener('submit', ev => {
+                    if (form.dataset.confirming === '1') { form.dataset.confirming = ''; return; }
+                    ev.preventDefault();
+                    showConfirm(msg, () => {
+                        form.dataset.confirming = '1';
+                        if (form.requestSubmit) form.requestSubmit(); else form.submit();
+                    });
+                });
+            });
+        })();
+    </script>
+</body>
+</html>
+

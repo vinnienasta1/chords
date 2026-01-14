@@ -1,0 +1,21 @@
+# secrets / local config
+.env
+.env.*
+db.php
+config.php
+*.sql
+*.dump
+*.bak
+*.backup
+*.log
+
+# tools / binaries
+phpmyadmin/
+node_modules/
+vendor/
+
+# caches
+*.cache
+.cache/
+.tmp/
+.DS_Store

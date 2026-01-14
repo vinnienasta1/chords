@@ -1,0 +1,5 @@
+# Redirect favicon.ico to favicon.svg
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^favicon\.ico$ /favicon.svg [L]
+</IfModule>
