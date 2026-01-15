@@ -26,7 +26,31 @@ if (!$user) {
 $initial = strtoupper(substr($username, 0, 1) ?: 'G');
 $isAdmin = (int)$user['is_admin'] === 1;
 $csrf = csrf_token();
-$telegramBotLink = getenv('TELEGRAM_BOT_LINK') ?: 'https://t.me/vinnienasta_bot'; // задайте TELEGRAM_BOT_LINK в окружении
+
+// Функции для работы с настройками бота
+function getBotSetting(PDO $db, string $key, string $default = ''): string {
+    try {
+        $stmt = $db->prepare('SELECT setting_value FROM bot_settings WHERE setting_key = ?');
+        $stmt->execute([$key]);
+        $result = $stmt->fetchColumn();
+        return $result !== false ? (string)$result : $default;
+    } catch (Throwable $e) {
+        error_log('Error getting bot setting: ' . $e->getMessage());
+        return $default;
+    }
+}
+
+// Получаем настройки бота из БД
+$botEndpoint = getBotSetting($db, 'bot_endpoint', 'http://192.168.3.110:8080');
+$botUrl = getBotSetting($db, 'bot_url', '');
+// Формируем ссылку на бота: если есть bot_url, используем его, иначе fallback
+if (!empty($botUrl)) {
+    // Убираем @ если есть и формируем ссылку
+    $botUsername = ltrim($botUrl, '@');
+    $telegramBotLink = 'https://t.me/' . $botUsername;
+} else {
+    $telegramBotLink = getenv('TELEGRAM_BOT_LINK') ?: 'https://t.me/vinnienasta_bot';
+}
 $tgVerified = ($_SESSION['tg_verified_ok'] ?? false) || ((int)($user['verified'] ?? 0) === 1);
 
 $message = '';
@@ -36,7 +60,7 @@ $messageType = '';
 if (!empty($_SESSION['tg_verification_key']) && !($tgVerified)) {
     $key = $_SESSION['tg_verification_key'];
     $pendingTg = $_SESSION['tg_pending_username'] ?? null;
-    $ch = curl_init('http://192.168.3.110:8080/check_verification');
+    $ch = curl_init(rtrim($botEndpoint, '/') . '/check_verification');
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST => true,
@@ -77,7 +101,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'user_id' => $user['id'] ?? null,
         ];
         $_SESSION['tg_pending_username'] = $tgUser;
-        $ch = curl_init('http://192.168.3.110:8080/create_verification');
+        $ch = curl_init(rtrim($botEndpoint, '/') . '/create_verification');
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_POST => true,
@@ -177,7 +201,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$tgVerified) {
                 $key = $_SESSION['tg_verification_key'] ?? null;
                 if ($key) {
-                    $ch = curl_init('http://192.168.3.110:8080/check_verification');
+                    $ch = curl_init(rtrim($botEndpoint, '/') . '/check_verification');
                     curl_setopt_array($ch, [
                         CURLOPT_RETURNTRANSFER => true,
                         CURLOPT_POST => true,

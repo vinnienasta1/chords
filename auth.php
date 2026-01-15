@@ -22,8 +22,30 @@ $error = '';
 $success = '';
 $action = $isFirstUser ? 'bootstrap_admin' : ($_GET['action'] ?? 'login'); // 'login' или 'register'
 
-// Простые запрещенные пароли
-$botLink = getenv('TELEGRAM_BOT_LINK') ?: 'https://t.me/vinnienasta_bot';
+// Функции для работы с настройками бота
+function getBotSetting(PDO $db, string $key, string $default = ''): string {
+    try {
+        $stmt = $db->prepare('SELECT setting_value FROM bot_settings WHERE setting_key = ?');
+        $stmt->execute([$key]);
+        $result = $stmt->fetchColumn();
+        return $result !== false ? (string)$result : $default;
+    } catch (Throwable $e) {
+        error_log('Error getting bot setting: ' . $e->getMessage());
+        return $default;
+    }
+}
+
+// Получаем настройки бота из БД
+$botEndpoint = getBotSetting($db, 'bot_endpoint', 'http://192.168.3.110:8080');
+$botUrl = getBotSetting($db, 'bot_url', '');
+// Формируем ссылку на бота: если есть bot_url, используем его, иначе fallback
+if (!empty($botUrl)) {
+    // Убираем @ если есть и формируем ссылку
+    $botUsername = ltrim($botUrl, '@');
+    $botLink = 'https://t.me/' . $botUsername;
+} else {
+    $botLink = getenv('TELEGRAM_BOT_LINK') ?: 'https://t.me/vinnienasta_bot';
+}
 $verificationKey = $_SESSION['tg_reg_key'] ?? null;
 $verificationUsername = $_SESSION['tg_reg_username'] ?? null;
 $verificationStatus = null;
@@ -89,7 +111,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'telegram_username' => $username,
                     'require_password' => true,
                 ];
-                $ch = curl_init('http://192.168.3.110:8080/create_verification');
+                $ch = curl_init(rtrim($botEndpoint, '/') . '/create_verification');
                 curl_setopt_array($ch, [
                     CURLOPT_RETURNTRANSFER => true,
                     CURLOPT_POST => true,
@@ -166,7 +188,7 @@ $initial = 'G';
 $statusText = '';
 // Периодический опрос статуса, если есть ключ
 if ($verificationKey) {
-    $ch = curl_init('http://192.168.3.110:8080/check_verification');
+    $ch = curl_init(rtrim($botEndpoint, '/') . '/check_verification');
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST => true,

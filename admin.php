@@ -22,6 +22,28 @@ $userData = getCurrentUser($username);
 extract($userData);
 $db = DB::getConnection();
 
+// Функции для работы с настройками бота
+function getBotSetting(PDO $db, string $key, string $default = ''): string {
+    $stmt = $db->prepare('SELECT setting_value FROM bot_settings WHERE setting_key = ?');
+    $stmt->execute([$key]);
+    $result = $stmt->fetchColumn();
+    return $result !== false ? (string)$result : $default;
+}
+
+function setBotSetting(PDO $db, string $key, string $value): void {
+    $stmt = $db->prepare('INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)');
+    $stmt->execute([$key, $value]);
+}
+
+function getAllBotSettings(PDO $db): array {
+    $stmt = $db->query('SELECT setting_key, setting_value FROM bot_settings');
+    $result = [];
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $result[$row['setting_key']] = $row['setting_value'];
+    }
+    return $result;
+}
+
 // Разрешаем доступ админам (is_admin == 1) и модераторам (is_admin == 2)
 if (!$user || ((int)$user['is_admin'] != 1 && (int)$user['is_admin'] != 2)) {
     header('Location: /');
@@ -262,42 +284,233 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 break;
             case 'broadcast':
+                if ($user['is_admin'] != 1) {
+                    header("Content-Type: application/json; charset=utf-8");
+                    echo json_encode(['ok' => false, 'error' => 'Доступ запрещен']);
+                    exit;
+                }
                 header("Content-Type: application/json; charset=utf-8");
                 $text = trim($_POST['broadcast_text'] ?? '');
                 if ($text === '') {
                     echo json_encode(['ok' => false, 'error' => 'Введите текст для рассылки']);
                     exit;
                 }
-                $token = getenv('BROADCAST_TOKEN') ?: '';
+                // Получаем настройки из БД или переменных окружения
+                $token = getBotSetting($db, 'broadcast_token', getenv('BROADCAST_TOKEN') ?: '');
+                $endpoint = getBotSetting($db, 'bot_endpoint', 'http://192.168.3.110:8080');
+                if (empty($token)) {
+                    echo json_encode(['ok' => false, 'error' => 'Токен рассылки не настроен. Настройте бота во вкладке TG Bot.']);
+                    exit;
+                }
+                if (empty($endpoint)) {
+                    echo json_encode(['ok' => false, 'error' => 'Endpoint бота не настроен. Настройте бота во вкладке TG Bot.']);
+                    exit;
+                }
+                // Пробуем несколько вариантов передачи токена
+                // Вариант 1: токен в теле запроса (основной)
                 $payload = json_encode(['text' => $text, 'token' => $token], JSON_UNESCAPED_UNICODE);
-                $ch = curl_init('http://192.168.3.110:8080/broadcast');
+                $broadcastUrl = rtrim($endpoint, '/') . '/broadcast';
+                $ch = curl_init($broadcastUrl);
                 curl_setopt_array($ch, [
                     CURLOPT_RETURNTRANSFER => true,
                     CURLOPT_POST => true,
                     CURLOPT_POSTFIELDS => $payload,
-                    CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+                    CURLOPT_HTTPHEADER => [
+                        'Content-Type: application/json',
+                    ],
                     CURLOPT_TIMEOUT => 10,
                     CURLOPT_CONNECTTIMEOUT => 5,
                     CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
                 ]);
                 $resp = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlErr = curl_error($ch);
                 curl_close($ch);
+                
+                // Если получили 403, пробуем вариант с токеном в заголовке Authorization
+                if ($httpCode === 403) {
+                    $ch = curl_init($broadcastUrl);
+                    curl_setopt_array($ch, [
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_POST => true,
+                        CURLOPT_POSTFIELDS => json_encode(['text' => $text], JSON_UNESCAPED_UNICODE),
+                        CURLOPT_HTTPHEADER => [
+                            'Content-Type: application/json',
+                            'Authorization: Bearer ' . $token,
+                        ],
+                        CURLOPT_TIMEOUT => 10,
+                        CURLOPT_CONNECTTIMEOUT => 5,
+                        CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
+                    ]);
+                    $resp = curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $curlErr = curl_error($ch);
+                    curl_close($ch);
+                }
+                
                 if ($resp === false) {
-                    echo json_encode(['ok' => false, 'error' => 'Сервис рассылки недоступен']);
+                    echo json_encode(['ok' => false, 'error' => 'Сервис рассылки недоступен: ' . ($curlErr ?: 'Не удалось подключиться')]);
                     exit;
                 }
+                
+                // Проверяем HTTP статус код
+                if ($httpCode === 403 || $httpCode === 401) {
+                    // Пытаемся извлечь детальное сообщение об ошибке
+                    $errorData = json_decode($resp, true);
+                    $errorDetail = '';
+                    if (is_array($errorData)) {
+                        $errorDetail = isset($errorData['error']) ? ': ' . $errorData['error'] : 
+                                      (isset($errorData['message']) ? ': ' . $errorData['message'] : '');
+                    }
+                    echo json_encode([
+                        'ok' => false, 
+                        'error' => 'Доступ запрещен (HTTP ' . $httpCode . ')' . $errorDetail . '. Проверьте правильность токена рассылки во вкладке TG Bot.'
+                    ]);
+                    exit;
+                }
+                
+                if ($httpCode < 200 || $httpCode >= 300) {
+                    // Пытаемся извлечь сообщение об ошибке из ответа
+                    $errorData = json_decode($resp, true);
+                    $errorMsg = 'Ошибка рассылки (HTTP ' . $httpCode . ')';
+                    if (is_array($errorData)) {
+                        if (isset($errorData['error'])) {
+                            $errorMsg = $errorData['error'];
+                        } elseif (isset($errorData['message'])) {
+                            $errorMsg = $errorData['message'];
+                        } elseif (!empty($resp)) {
+                            // Если ответ не JSON, показываем первые 200 символов
+                            $errorMsg .= ': ' . substr(strip_tags($resp), 0, 200);
+                        }
+                    }
+                    echo json_encode(['ok' => false, 'error' => $errorMsg]);
+                    exit;
+                }
+                
                 $data = json_decode($resp, true);
-                if (!is_array($data) || ($data['status'] ?? '') !== 'success') {
-                    $errMsg = $data['error'] ?? 'Ошибка рассылки';
+                if (!is_array($data)) {
+                    echo json_encode(['ok' => false, 'error' => 'Некорректный ответ от сервера рассылки']);
+                    exit;
+                }
+                
+                if (($data['status'] ?? '') !== 'success') {
+                    $errMsg = $data['error'] ?? $data['message'] ?? 'Ошибка рассылки';
                     echo json_encode(['ok' => false, 'error' => $errMsg]);
                     exit;
                 }
+                
+                $sent = $data['sent'] ?? 0;
+                $failed = $data['failed'] ?? 0;
+                $total = $data['total'] ?? 0;
+                
+                // Если отправлено 0, добавляем предупреждение
+                $message = '';
+                if ($total === 0) {
+                    $message = ' Внимание: не найдено пользователей для рассылки. Убедитесь, что пользователи подтверждены через Telegram бота и имеют заполненное поле telegram.';
+                } elseif ($sent === 0 && $total > 0) {
+                    $message = ' Внимание: найдено ' . $total . ' пользователей, но никому не отправлено. Проверьте логи бота.';
+                }
+                
                 echo json_encode([
                     'ok' => true,
-                    'sent' => $data['sent'] ?? 0,
-                    'failed' => $data['failed'] ?? 0,
-                    'total' => $data['total'] ?? 0,
+                    'sent' => $sent,
+                    'failed' => $failed,
+                    'total' => $total,
+                    'message' => $message,
                 ]);
+                exit;
+                break;
+            case 'save_bot_settings':
+                if ($user['is_admin'] != 1) {
+                    header("Content-Type: application/json; charset=utf-8");
+                    echo json_encode(['ok' => false, 'error' => 'Доступ запрещен']);
+                    exit;
+                }
+                header("Content-Type: application/json; charset=utf-8");
+                $botToken = trim($_POST['bot_token'] ?? '');
+                $adminId = trim($_POST['admin_id'] ?? '');
+                $endpoint = trim($_POST['bot_endpoint'] ?? '');
+                $botUrl = trim($_POST['bot_url'] ?? '');
+                $broadcastToken = trim($_POST['broadcast_token'] ?? '');
+                
+                // Нормализуем username бота: извлекаем @username из полного URL если нужно
+                if (!empty($botUrl)) {
+                    // Убираем https://t.me/ или http://t.me/
+                    $botUrl = preg_replace('#^https?://t\.me/#i', '', $botUrl);
+                    // Убираем t.me/
+                    $botUrl = preg_replace('#^t\.me/#i', '', $botUrl);
+                    // Убираем ведущие пробелы и добавляем @ если его нет
+                    $botUrl = trim($botUrl);
+                    if (!empty($botUrl) && $botUrl[0] !== '@') {
+                        $botUrl = '@' . $botUrl;
+                    }
+                }
+                
+                try {
+                    if (!empty($botToken)) setBotSetting($db, 'bot_token', $botToken);
+                    if (!empty($adminId)) setBotSetting($db, 'admin_id', $adminId);
+                    if (!empty($endpoint)) setBotSetting($db, 'bot_endpoint', $endpoint);
+                    if (!empty($botUrl)) setBotSetting($db, 'bot_url', $botUrl);
+                    if (!empty($broadcastToken)) setBotSetting($db, 'broadcast_token', $broadcastToken);
+                    
+                    echo json_encode(['ok' => true, 'message' => 'Настройки сохранены']);
+                } catch (Throwable $e) {
+                    echo json_encode(['ok' => false, 'error' => 'Ошибка при сохранении: ' . $e->getMessage()]);
+                }
+                exit;
+                break;
+            case 'check_bot_connection':
+                if ($user['is_admin'] != 1) {
+                    header("Content-Type: application/json; charset=utf-8");
+                    echo json_encode(['ok' => false, 'error' => 'Доступ запрещен']);
+                    exit;
+                }
+                header("Content-Type: application/json; charset=utf-8");
+                $endpoint = trim($_POST['endpoint'] ?? '');
+                
+                if (empty($endpoint)) {
+                    echo json_encode(['ok' => false, 'error' => 'Endpoint не указан']);
+                    exit;
+                }
+                
+                try {
+                    // Проверяем доступность бота через простой HEAD запрос к базовому URL
+                    // Это не требует специальных параметров и просто проверяет, отвечает ли сервер
+                    $baseUrl = rtrim($endpoint, '/');
+                    
+                    $ch = curl_init($baseUrl);
+                    curl_setopt_array($ch, [
+                        CURLOPT_RETURNTRANSFER => true,
+                        CURLOPT_NOBODY => true, // HEAD запрос - быстрее и не требует тела ответа
+                        CURLOPT_TIMEOUT => 5,
+                        CURLOPT_CONNECTTIMEOUT => 3,
+                        CURLOPT_FOLLOWLOCATION => true,
+                    ]);
+                    
+                    curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $curlError = curl_error($ch);
+                    curl_close($ch);
+                    
+                    if ($curlError) {
+                        echo json_encode(['ok' => false, 'error' => 'Ошибка подключения: ' . $curlError]);
+                    } elseif ($httpCode >= 200 && $httpCode < 500) {
+                        // Любой ответ от 200 до 499 означает, что сервер доступен и отвечает
+                        // (400-499 это ошибки запроса, но сервер работает)
+                        $message = 'Бот доступен и отвечает';
+                        if ($httpCode >= 200 && $httpCode < 300) {
+                            $message .= ' (HTTP ' . $httpCode . ')';
+                        } else {
+                            $message .= ' (HTTP ' . $httpCode . ' - сервер работает)';
+                        }
+                        echo json_encode(['ok' => true, 'message' => $message]);
+                    } else {
+                        // 500+ или нет ответа
+                        echo json_encode(['ok' => false, 'error' => 'Сервер недоступен (HTTP ' . $httpCode . ')']);
+                    }
+                } catch (Throwable $e) {
+                    echo json_encode(['ok' => false, 'error' => 'Ошибка: ' . $e->getMessage()]);
+                }
                 exit;
                 break;
             case 'delete_user':
@@ -512,7 +725,7 @@ $usersList = $db->query('
 ')->fetchAll();
 
 // Загружаем историю только для админов
-// Убеждаемся, что таблицы созданы
+// Убеждаемся, что таблицы созданы (включая bot_settings)
 DB::init();
 $history = [];
 if ((int)$user['is_admin'] === 1) {
@@ -533,13 +746,21 @@ if ($selectedSongId > 0) {
     $stmt->execute([$selectedSongId]);
     $chords = $stmt->fetchAll();
 }
+
+// Загружаем настройки бота
+$botSettings = getAllBotSettings($db);
+$botToken = $botSettings['bot_token'] ?? '';
+$adminId = $botSettings['admin_id'] ?? '';
+$botEndpoint = $botSettings['bot_endpoint'] ?? 'http://192.168.3.110:8080';
+$botUrl = $botSettings['bot_url'] ?? 'https://t.me/vinnienasta_bot';
+$broadcastToken = $botSettings['broadcast_token'] ?? getenv('BROADCAST_TOKEN') ?: '';
 ?>
 <!DOCTYPE html>
 <html lang='ru'>
 <head>
     <meta charset='UTF-8'>
     <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-    <title>Админка - Управление песнями</title>
+    <title>Админ-панель - Управление песнями</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="alternate icon" href="/favicon.svg">
     <script>
@@ -619,9 +840,26 @@ if ($selectedSongId > 0) {
         /* Показываем вкладки по умолчанию — если JS не сработает, контент всё равно видно */
         .tab-content { display:block; }
         /* Когда JS инициализировал табы, скрываем лишние */
-        body.tabs-ready .tab-content { display:none; }
-        body.tabs-ready .tab-content:target { display:block; }
-        body.tabs-ready .tab-content.active { display:block; }
+        body.tabs-ready .tab-content { 
+            display:none; 
+        }
+        body.tabs-ready .tab-content.active { 
+            display:block; 
+        }
+        /* КРИТИЧНО: Дополнительные правила для проблемных вкладок */
+        body.tabs-ready #broadcast.active,
+        body.tabs-ready #tg-bot.active {
+            display:block !important;
+            visibility:visible !important;
+            opacity:1 !important;
+            height:auto !important;
+            overflow:visible !important;
+        }
+        /* Убеждаемся, что контент внутри этих вкладок тоже виден */
+        body.tabs-ready #broadcast.active *,
+        body.tabs-ready #tg-bot.active * {
+            visibility:inherit;
+        }
         .form-group { margin-bottom:1rem; }
         #users .songs-list { margin-top:1.5rem; }
         input[type='text'], textarea { width:100%; padding:0.75rem; border-radius:10px; border:1px solid var(--input-border); background:var(--input-bg); color:var(--text); }
@@ -1109,19 +1347,19 @@ if ($selectedSongId > 0) {
         <main class="content">
             <div class="card">
                 <div class="admin-header">
-                    <h1>Админка</h1>
+                    <h1>Админ-панель</h1>
                     <p class="meta meta-compact">Управление песнями и пользователями</p>
                 </div>
                 <?php if ($message): ?><div class="message <?php echo $messageType; ?>"><?php echo htmlspecialchars($message); ?></div><?php endif; ?>
 
                 <div class="tabs-bar">
                     <div class="tabs">
-                        <button class="tab active" type="button" data-tab="songs" onclick="showTab('songs', event)">Песни</button>
+                        <button class="tab active" type="button" data-tab="songs">Песни</button>
                         <?php if ($user['is_admin'] == 1): ?>
-                            <button class="tab" type="button" data-tab="users" onclick="showTab('users', event)" id="users-tab">Пользователи</button>
-                            <button class="tab" type="button" data-tab="history" onclick="showTab('history', event)" id="history-tab">История</button>
-                            <button class="tab" type="button" data-tab="broadcast" onclick="showTab('broadcast', event)" id="broadcast-tab">Рассылка</button>
-                            <button class="tab" type="button" data-tab="tg-bot" onclick="showTab('tg-bot', event)" id="tg-bot-tab">TG Bot</button>
+                            <button class="tab" type="button" data-tab="users" id="users-tab">Пользователи</button>
+                            <button class="tab" type="button" data-tab="history" id="history-tab">История</button>
+                            <button class="tab" type="button" data-tab="broadcast" id="broadcast-tab">Рассылка</button>
+                            <button class="tab" type="button" data-tab="tg-bot" id="tg-bot-tab">TG Bot</button>
                         <?php endif; ?>
                     </div>
                 </div>
@@ -1289,25 +1527,26 @@ if ($selectedSongId > 0) {
                 
                 <div id='users' class='tab-content'>
                     <h2>Пользователи</h2>
-                <div class="form-group">
-                    <form method="POST" class="form-inline-wrap">
+                    <div class="form-group">
+                        <form method="POST" class="form-inline-wrap">
                             <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrf); ?>">
                             <input type="hidden" name="action" value="add_user">
-                        <div class="minw-140" style="flex:1;">
+                            <div class="minw-140" style="flex:1;">
                                 <label for="new_username">Логин</label>
                                 <input type="text" id="new_username" name="new_username" required>
                             </div>
-                        <div class="password-field-wrapper minw-140" style="flex:1;">
-                            <div class="pw-field">
+                            <div class="password-field-wrapper minw-140" style="flex:1;">
+                                <div class="pw-field">
                                     <label for="new_password">Пароль</label>
                                     <input type="text" id="new_password" name="new_password" required>
                                 </div>
                                 <input type="hidden" name="new_is_admin" id="new_is_admin" value="0">
-                            <div class="pw-actions">
-                                <button class="btn secondary btn-icon flex-shrink-0" type="button" id="new-admin-toggle" title="Пользователь" aria-label="Роль" aria-pressed="false">
-                                    <?php echo renderIcon('shield1', 16, 16); ?>
-                                </button>
-                                <button class="btn flex-shrink-0" type="submit">Добавить</button>
+                                <div class="pw-actions">
+                                    <button class="btn secondary btn-icon flex-shrink-0" type="button" id="new-admin-toggle" title="Пользователь" aria-label="Роль" aria-pressed="false">
+                                        <?php echo renderIcon('shield1', 16, 16); ?>
+                                    </button>
+                                    <button class="btn flex-shrink-0" type="submit">Добавить</button>
+                                </div>
                             </div>
                         </form>
                     </div>
@@ -1411,33 +1650,58 @@ if ($selectedSongId > 0) {
                     </div>
                 </div>
 
-                
                 <!-- Вкладка Рассылка -->
                 <div id='broadcast' class='tab-content'>
                     <h2>Рассылка</h2>
+                    <p class="meta" style="margin-bottom:1rem;">Отправка сообщений всем пользователям через Telegram бота</p>
                     <div class="form-group">
                         <label for="broadcast-text">Текст рассылки</label>
-                        <textarea id="broadcast-text" name="broadcast_text" rows="5" style="width:100%; padding:0.75rem; border-radius:10px; border:1px solid var(--border); background:var(--panel); color:var(--text);"></textarea>
+                        <textarea id="broadcast-text" name="broadcast_text" rows="8" placeholder="Введите текст сообщения для рассылки..." style="width:100%; padding:0.75rem; border-radius:10px; border:1px solid var(--border); background:var(--input-bg); color:var(--text); font-family:inherit; resize:vertical;"></textarea>
                     </div>
-                    <button class="btn" id="broadcast-start" type="button" data-csrf="<?php echo htmlspecialchars($csrf); ?>">Запустить рассылку</button>
+                    <div class="form-group">
+                        <button class="btn" id="broadcast-start" type="button" data-csrf="<?php echo htmlspecialchars($csrf); ?>">Запустить рассылку</button>
+                        <p class="meta" id="broadcast-status" style="margin-top:0.75rem;"></p>
+                    </div>
                 </div>
 
                 <!-- Вкладка TG Bot -->
                 <div id='tg-bot' class='tab-content'>
-                    <h2>Telegram Bot</h2>
-                    <div class="form-group">
-                        <label>Endpoint бота</label>
-                        <input type="text" value="http://192.168.3.110:8080" disabled>
-                    </div>
-                    <div class="form-group">
-                        <label>Основной URL бота</label>
-                        <input type="text" value="https://t.me/vinnienasta_bot" disabled>
-                    </div>
-                    <div class="form-group">
-                        <label>Проверка доступности</label>
-                        <button class="btn" type="button" id="tg-bot-check">Проверить</button>
-                        <p class="meta" id="tg-bot-status">Не проверялось</p>
-                    </div>
+                    <h2>Настройки Telegram Bot</h2>
+                    <p class="meta" style="margin-bottom:1rem;">Настройте параметры подключения к Telegram боту</p>
+                    <form id="tg-bot-settings-form">
+                        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrf); ?>">
+                        <input type="hidden" name="action" value="save_bot_settings">
+                        <div class="form-group">
+                            <label for="bot-token">Bot Token</label>
+                            <input type="text" id="bot-token" name="bot_token" value="<?php echo htmlspecialchars($botToken); ?>" placeholder="1234567890:ABCdefGHIjklMNOpqrsTUVwxyz" style="width:100%; padding:0.75rem; border-radius:10px; border:1px solid var(--border); background:var(--input-bg); color:var(--text);">
+                            <p class="meta" style="font-size:0.85rem; margin-top:0.25rem;">Токен бота от @BotFather</p>
+                        </div>
+                        <div class="form-group">
+                            <label for="admin-id">Admin ID</label>
+                            <input type="text" id="admin-id" name="admin_id" value="<?php echo htmlspecialchars($adminId); ?>" placeholder="123456789" style="width:100%; padding:0.75rem; border-radius:10px; border:1px solid var(--border); background:var(--input-bg); color:var(--text);">
+                            <p class="meta" style="font-size:0.85rem; margin-top:0.25rem;">Telegram ID администратора</p>
+                        </div>
+                        <div class="form-group">
+                            <label for="bot-endpoint">Endpoint бота</label>
+                            <input type="text" id="bot-endpoint" name="bot_endpoint" value="<?php echo htmlspecialchars($botEndpoint); ?>" placeholder="http://192.168.1.11:8080" style="width:100%; padding:0.75rem; border-radius:10px; border:1px solid var(--border); background:var(--input-bg); color:var(--text);">
+                            <p class="meta" style="font-size:0.85rem; margin-top:0.25rem;">URL API бота (Например: http://192.168.1.11:8080/)</p>
+                        </div>
+                        <div class="form-group">
+                            <label for="bot-url">Username бота</label>
+                            <input type="text" id="bot-url" name="bot_url" value="<?php echo htmlspecialchars($botUrl); ?>" placeholder="@vinnie_test_bot" style="width:100%; padding:0.75rem; border-radius:10px; border:1px solid var(--border); background:var(--input-bg); color:var(--text);">
+                            <p class="meta" style="font-size:0.85rem; margin-top:0.25rem;">Username бота в Telegram (например: @my_bot)</p>
+                        </div>
+                        <div class="form-group">
+                            <label for="broadcast-token">Broadcast Token</label>
+                            <input type="text" id="broadcast-token" name="broadcast_token" value="<?php echo htmlspecialchars($broadcastToken); ?>" placeholder="секретный_токен" style="width:100%; padding:0.75rem; border-radius:10px; border:1px solid var(--border); background:var(--input-bg); color:var(--text);">
+                            <p class="meta" style="font-size:0.85rem; margin-top:0.25rem;">Секретный токен для рассылки (должен совпадать с настройками бота)</p>
+                        </div>
+                        <div class="form-group">
+                            <button class="btn" type="submit">Сохранить настройки</button>
+                            <button class="btn secondary" type="button" id="tg-bot-check" style="margin-left:0.5rem;">Проверить подключение</button>
+                            <p class="meta" id="tg-bot-status" style="margin-top:0.75rem;"></p>
+                        </div>
+                    </form>
                 </div>
 
 <?php endif; ?>
@@ -1447,10 +1711,11 @@ if ($selectedSongId > 0) {
     <script>
         function showTab(tabName, ev) {
             if (ev) ev.preventDefault();
-            // Блокируем доступ модераторов к разделам users и history
+            // Блокируем доступ модераторов к недоступным разделам
             <?php if ($user['is_admin'] != 1): ?>
-            if (tabName === 'users' || tabName === 'history') {
-                alert('Доступ к этому разделу ограничен');
+            if (tabName !== 'songs') {
+                // Модераторы могут открыть только вкладку songs
+                showTab('songs', ev);
                 return;
             }
             <?php endif; ?>
@@ -1463,10 +1728,89 @@ if ($selectedSongId > 0) {
                 }
                 return;
             }
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            
+            // ВАЖНО: Сначала убираем активность со ВСЕХ вкладок и контента
+            // Это гарантирует, что только одна вкладка будет видна
+            const allTabs = document.querySelectorAll('.tab');
+            const allPanes = document.querySelectorAll('.tab-content');
+            
+            allTabs.forEach(t => {
+                t.classList.remove('active');
+            });
+            
+            // Сначала скрываем все вкладки через классы и стили
+            allPanes.forEach(pane => {
+                pane.classList.remove('active');
+                pane.style.display = 'none';
+                pane.style.visibility = 'hidden';
+                pane.style.opacity = '0';
+                pane.style.height = '0';
+                pane.style.overflow = 'hidden';
+            });
+            
+            // Активируем выбранную вкладку и контент
             targetTab.classList.add('active');
             targetPane.classList.add('active');
+            
+            // ПРИНУДИТЕЛЬНО показываем активную вкладку через inline стили
+            // Используем все возможные способы для гарантии отображения
+            targetPane.style.display = 'block';
+            targetPane.style.visibility = 'visible';
+            targetPane.style.opacity = '1';
+            targetPane.style.height = 'auto';
+            targetPane.style.overflow = 'visible';
+            targetPane.style.position = '';
+            targetPane.style.zIndex = '';
+            
+            // КРИТИЧНО: Убеждаемся, что ВСЕ дочерние элементы тоже видимы
+            // Это особенно важно для broadcast и tg-bot
+            const allChildren = targetPane.querySelectorAll('*');
+            allChildren.forEach(child => {
+                // Убираем любые inline стили, которые могут скрывать элементы
+                if (child.style.display === 'none') {
+                    child.style.display = '';
+                }
+                if (child.style.visibility === 'hidden') {
+                    child.style.visibility = '';
+                }
+                if (child.style.opacity === '0') {
+                    child.style.opacity = '';
+                }
+                if (child.style.height === '0' || child.style.height === '0px') {
+                    child.style.height = '';
+                }
+            });
+            
+            // Дополнительная проверка для проблемных вкладок через двойной requestAnimationFrame
+            if (tabName === 'broadcast' || tabName === 'tg-bot') {
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        const computedStyle = window.getComputedStyle(targetPane);
+                        console.log('Проверка вкладки', tabName, ':', {
+                            display: computedStyle.display,
+                            visibility: computedStyle.visibility,
+                            height: computedStyle.height,
+                            children: targetPane.children.length
+                        });
+                        
+                        // Если вкладка все еще скрыта, принудительно показываем
+                        if (computedStyle.display === 'none' || 
+                            computedStyle.visibility === 'hidden' || 
+                            computedStyle.height === '0px') {
+                            targetPane.style.cssText = 'display: block !important; visibility: visible !important; opacity: 1 !important; height: auto !important; overflow: visible !important;';
+                        }
+                        
+                        // Убеждаемся, что все дочерние элементы видны
+                        Array.from(targetPane.children).forEach(child => {
+                            const childStyle = window.getComputedStyle(child);
+                            if (childStyle.display === 'none') {
+                                child.style.cssText = 'display: block !important;';
+                            }
+                        });
+                    });
+                });
+            }
+            
             // Обновляем URL без перезагрузки страницы
             if (history.pushState) {
                 const newUrl = window.location.pathname + '#' + tabName;
@@ -1474,51 +1818,132 @@ if ($selectedSongId > 0) {
             }
         }
         
-        // Автоматически открываем нужную вкладку при загрузке страницы
-        (function() {
+        // Инициализация вкладок после загрузки DOM
+        document.addEventListener('DOMContentLoaded', function() {
+            // Сразу добавляем класс tabs-ready, чтобы CSS правила работали
+            document.body.classList.add('tabs-ready');
+            
+            // ОТЛАДКА: Проверяем наличие всех вкладок
+            const broadcastPane = document.getElementById('broadcast');
+            const tgBotPane = document.getElementById('tg-bot');
+            console.log('Диагностика вкладок:');
+            console.log('broadcast элемент:', broadcastPane);
+            console.log('tg-bot элемент:', tgBotPane);
+            if (broadcastPane) {
+                console.log('broadcast родитель:', broadcastPane.parentElement);
+                console.log('broadcast children:', broadcastPane.children.length);
+                console.log('broadcast innerHTML длина:', broadcastPane.innerHTML.length);
+            }
+            if (tgBotPane) {
+                console.log('tg-bot родитель:', tgBotPane.parentElement);
+                console.log('tg-bot children:', tgBotPane.children.length);
+                console.log('tg-bot innerHTML длина:', tgBotPane.innerHTML.length);
+            }
+            
+            // Сначала скрываем ВСЕ вкладки и убираем активность со всех кнопок
+            const allPanes = document.querySelectorAll('.tab-content');
+            const allTabs = document.querySelectorAll('.tab');
+            
+            console.log('Всего вкладок найдено:', allPanes.length);
+            allPanes.forEach((pane, index) => {
+                console.log(`Вкладка ${index}:`, pane.id, 'родитель:', pane.parentElement?.className);
+            });
+            
+            // Убираем активность со всех элементов
+            allPanes.forEach(pane => {
+                pane.classList.remove('active');
+            });
+            allTabs.forEach(tab => tab.classList.remove('active'));
+            
+            // Определяем, какую вкладку показать на основе hash
+            let targetTabName = 'songs';
             const hash = window.location.hash.substring(1);
+            
             <?php if ($user['is_admin'] != 1): ?>
-            // Модераторы не могут открыть вкладки users и history
-            if (hash === 'users' || hash === 'history') {
-                window.location.hash = 'songs';
-                showTab('songs');
-                return;
+            // Модераторы могут открыть только вкладку songs
+            if (hash === 'songs') {
+                targetTabName = 'songs';
+            } else {
+                // Если hash указывает на недоступную вкладку, сбрасываем на songs
+                if (hash) {
+                    window.location.hash = 'songs';
+                }
+                targetTabName = 'songs';
+            }
+            <?php else: ?>
+            // Админы могут открыть любую вкладку
+            if (hash && ['songs', 'users', 'history', 'broadcast', 'tg-bot'].includes(hash)) {
+                targetTabName = hash;
             }
             <?php endif; ?>
-            if (hash === 'users') {
-                showTab('users');
-            } else if (hash === 'history') {
-                showTab('history');
-            } else if (hash === 'broadcast') {
-                showTab('broadcast');
-            } else if (hash === 'tg-bot') {
-                showTab('tg-bot');
-            } else if (hash === 'songs') {
-                showTab('songs');
+            
+            // Показываем нужную вкладку (это добавит класс active и покажет правильную вкладку)
+            showTab(targetTabName);
+            
+            // КРИТИЧНО: Дополнительная проверка для проблемных вкладок
+            if (targetTabName === 'broadcast' || targetTabName === 'tg-bot') {
+                setTimeout(() => {
+                    const pane = document.getElementById(targetTabName);
+                    if (pane) {
+                        console.log('Принудительное отображение вкладки:', targetTabName);
+                        pane.style.cssText = 'display: block !important; visibility: visible !important; opacity: 1 !important; height: auto !important; overflow: visible !important;';
+                        // Убеждаемся, что все дочерние элементы видны
+                        Array.from(pane.querySelectorAll('*')).forEach(child => {
+                            const childStyle = window.getComputedStyle(child);
+                            if (childStyle.display === 'none') {
+                                child.style.display = '';
+                            }
+                        });
+                    }
+                }, 50);
             }
-            // Навешиваем клики на табы на случай, если inline onclick не сработает
+            
+            // Дополнительная проверка: убеждаемся, что активная вкладка действительно видна
+            setTimeout(() => {
+                const activePane = document.querySelector('.tab-content.active');
+                if (activePane) {
+                    const computedStyle = window.getComputedStyle(activePane);
+                    if (computedStyle.display === 'none') {
+                        activePane.style.display = 'block';
+                    }
+                }
+            }, 10);
+            
+            // Навешиваем обработчики кликов на вкладки
             document.querySelectorAll('.tabs .tab').forEach(btn => {
-                btn.addEventListener('click', (ev) => {
+                btn.addEventListener('click', function(ev) {
                     const tab = btn.dataset.tab;
-                    if (tab) showTab(tab, ev);
+                    if (tab) {
+                        showTab(tab, ev);
+                    }
                 });
             });
             
-            // Фолбек: если по какой-то причине ни одна вкладка не активна, пробуем активировать по хэшу или songs
-            (function ensureTabVisible() {
-                const panes = Array.from(document.querySelectorAll('.tab-content'));
-                if (!panes.length) return;
-                const activePane = panes.find(p => p.classList.contains('active'));
-                if (activePane) return;
-                const hash = window.location.hash.substring(1);
-                const paneByHash = hash ? document.getElementById(hash) : null;
-                const tabName = paneByHash ? hash : 'songs';
-                showTab(tabName);
-            })();
-
-            // После всех инициализаций помечаем, что табы готовы — можно скрывать неактивные
-            document.body.classList.add('tabs-ready');
-        })();
+            // Обработчик изменения hash (на случай, если пользователь использует кнопки браузера)
+            window.addEventListener('hashchange', function() {
+                const newHash = window.location.hash.substring(1);
+                <?php if ($user['is_admin'] != 1): ?>
+                // Модераторы могут открыть только вкладку songs
+                if (newHash !== 'songs') {
+                    window.location.hash = 'songs';
+                    showTab('songs');
+                    return;
+                }
+                if (newHash === 'songs') {
+                    showTab('songs');
+                }
+                <?php else: ?>
+                // Админы могут открыть любую вкладку
+                if (newHash && ['songs', 'users', 'history', 'broadcast', 'tg-bot'].includes(newHash)) {
+                    const targetTab = document.querySelector('.tab[data-tab="' + newHash + '"]');
+                    const targetPane = document.getElementById(newHash);
+                    if (targetTab && targetPane) {
+                        showTab(newHash);
+                    }
+                }
+                <?php endif; ?>
+            });
+        });
         const songsFilter = document.getElementById('songs-filter');
         const songsList = document.getElementById('songs-list');
         if (songsFilter && songsList) {
@@ -1632,42 +2057,185 @@ if ($selectedSongId > 0) {
         (function() {
             const btn = document.getElementById('broadcast-start');
             const textArea = document.getElementById('broadcast-text');
+            const statusEl = document.getElementById('broadcast-status');
             if (!btn || !textArea) return;
-            btn.addEventListener('click', () => {
+            
+            btn.addEventListener('click', async () => {
                 const text = (textArea.value || '').trim();
                 if (!text) {
-                    alert('Введите текст для рассылки');
+                    showToast('Введите текст для рассылки', 'error');
                     return;
                 }
-                if (!confirm('Запустить рассылку?')) return;
-                alert('Рассылка будет реализована на бэкенде (пока заглушка)');
+                if (!confirm('Запустить рассылку всем пользователям?')) return;
+                
+                btn.disabled = true;
+                btn.textContent = 'Отправка...';
+                if (statusEl) {
+                    statusEl.textContent = 'Отправка сообщений...';
+                    statusEl.style.color = '';
+                }
+                
+                try {
+                    const fd = new FormData();
+                    fd.append('csrf_token', btn.dataset.csrf || '');
+                    fd.append('action', 'broadcast');
+                    fd.append('broadcast_text', text);
+                    
+                    const resp = await fetch('/admin.php', {
+                        method: 'POST',
+                        body: fd
+                    });
+                    
+                    const data = await resp.json();
+                    
+                    if (data.ok) {
+                        const sent = data.sent || 0;
+                        const failed = data.failed || 0;
+                        const total = data.total || 0;
+                        const message = data.message || '';
+                        
+                        if (total === 0) {
+                            showToast('Рассылка выполнена, но не найдено получателей. Пользователи должны быть подтверждены через Telegram бота.', 'error', 7000);
+                            if (statusEl) {
+                                statusEl.textContent = 'Не найдено получателей. Пользователи должны быть подтверждены через Telegram бота и иметь заполненное поле telegram.';
+                                statusEl.style.color = '#f87171';
+                            }
+                        } else if (sent === 0 && total > 0) {
+                            showToast('Рассылка выполнена, но никому не отправлено. Проверьте логи бота.', 'error', 7000);
+                            if (statusEl) {
+                                statusEl.textContent = `Найдено ${total} получателей, но отправка не удалась. Проверьте логи бота.`;
+                                statusEl.style.color = '#f87171';
+                            }
+                        } else {
+                            showToast(`Рассылка завершена! Отправлено: ${sent}, Ошибок: ${failed}`, 'success', 5000);
+                            if (statusEl) {
+                                statusEl.textContent = `Отправлено: ${sent}, Ошибок: ${failed}, Всего: ${total}`;
+                                statusEl.style.color = '#22c55e';
+                            }
+                            textArea.value = '';
+                        }
+                    } else {
+                        showToast(data.error || 'Ошибка рассылки', 'error', 5000);
+                        if (statusEl) {
+                            statusEl.textContent = 'Ошибка: ' + (data.error || 'Неизвестная ошибка');
+                            statusEl.style.color = '#f87171';
+                        }
+                    }
+                } catch (err) {
+                    console.error('Broadcast error:', err);
+                    showToast('Ошибка при отправке рассылки', 'error', 5000);
+                    if (statusEl) {
+                        statusEl.textContent = 'Ошибка подключения';
+                        statusEl.style.color = '#f87171';
+                    }
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = 'Запустить рассылку';
+                }
             });
         })();
 
+        // Сохранение настроек TG бота
+        (function() {
+            const form = document.getElementById('tg-bot-settings-form');
+            if (!form) return;
+            
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const btn = form.querySelector('button[type="submit"]');
+                const statusEl = document.getElementById('tg-bot-status');
+                
+                if (btn) btn.disabled = true;
+                if (statusEl) {
+                    statusEl.textContent = 'Сохранение...';
+                    statusEl.style.color = '';
+                }
+                
+                try {
+                    const fd = new FormData(form);
+                    const resp = await fetch('/admin.php', {
+                        method: 'POST',
+                        body: fd
+                    });
+                    
+                    const data = await resp.json();
+                    
+                    if (data.ok) {
+                        showToast('Настройки сохранены', 'success');
+                        if (statusEl) {
+                            statusEl.textContent = 'Настройки сохранены';
+                            statusEl.style.color = '#22c55e';
+                        }
+                    } else {
+                        showToast(data.error || 'Ошибка при сохранении', 'error', 5000);
+                        if (statusEl) {
+                            statusEl.textContent = 'Ошибка: ' + (data.error || 'Неизвестная ошибка');
+                            statusEl.style.color = '#f87171';
+                        }
+                    }
+                } catch (err) {
+                    console.error('Save settings error:', err);
+                    showToast('Ошибка при сохранении настроек', 'error', 5000);
+                    if (statusEl) {
+                        statusEl.textContent = 'Ошибка подключения';
+                        statusEl.style.color = '#f87171';
+                    }
+                } finally {
+                    if (btn) btn.disabled = false;
+                }
+            });
+        })();
+        
         // Проверка TG бота
         (function() {
             const btn = document.getElementById('tg-bot-check');
             const statusEl = document.getElementById('tg-bot-status');
             if (!btn || !statusEl) return;
+            
             btn.addEventListener('click', async () => {
+                const endpointInput = document.getElementById('bot-endpoint');
+                const endpoint = endpointInput ? (endpointInput.value || '').trim() : 'http://192.168.3.110:8080';
+                
+                if (!endpoint) {
+                    showToast('Укажите endpoint бота', 'error');
+                    return;
+                }
+                
                 statusEl.textContent = 'Проверяем...';
                 statusEl.style.color = '';
+                btn.disabled = true;
+                
                 try {
-                    const resp = await fetch('http://192.168.3.110:8080/check_verification', {
+                    const form = document.getElementById('tg-bot-settings-form');
+                    const csrfToken = form ? form.querySelector('input[name="csrf_token"]')?.value : '';
+                    
+                    const formData = new FormData();
+                    formData.append('action', 'check_bot_connection');
+                    formData.append('csrf_token', csrfToken);
+                    formData.append('endpoint', endpoint);
+                    
+                    const resp = await fetch('/admin.php', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ ping: true }),
+                        body: formData
                     });
-                    if (resp.ok) {
+                    
+                    const data = await resp.json();
+                    
+                    if (data.ok) {
                         statusEl.textContent = 'OK: бот отвечает';
                         statusEl.style.color = '#22c55e';
+                        showToast('Бот доступен и отвечает', 'success');
                     } else {
-                        statusEl.textContent = 'Ошибка: ' + resp.status;
+                        statusEl.textContent = 'Ошибка: ' + (data.error || 'Неизвестная ошибка');
                         statusEl.style.color = '#f87171';
+                        showToast(data.error || 'Бот недоступен', 'error', 5000);
                     }
                 } catch (e) {
-                    statusEl.textContent = 'Недоступен';
+                    statusEl.textContent = 'Недоступен: ' + (e.message || 'Ошибка подключения');
                     statusEl.style.color = '#f87171';
+                    showToast('Бот недоступен. Проверьте endpoint и убедитесь, что бот запущен.', 'error', 5000);
+                } finally {
+                    btn.disabled = false;
                 }
             });
         })();
