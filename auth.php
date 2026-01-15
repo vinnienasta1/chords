@@ -4,6 +4,15 @@ require_once __DIR__ . '/db.php';
 ensure_session_started();
 DB::init();
 
+$db = DB::getConnection();
+$isFirstUser = false;
+try {
+    $cnt = $db->query('SELECT COUNT(*) FROM users');
+    $isFirstUser = ((int)$cnt->fetchColumn()) === 0;
+} catch (Throwable $e) {
+    $isFirstUser = true; // если таблицы ещё нет, считаем базу пустой
+}
+
 if (isset($_SESSION['authenticated']) && $_SESSION['authenticated'] === true) {
     header('Location: /');
     exit;
@@ -11,8 +20,7 @@ if (isset($_SESSION['authenticated']) && $_SESSION['authenticated'] === true) {
 
 $error = '';
 $success = '';
-$db = DB::getConnection();
-$action = $_GET['action'] ?? 'login'; // 'login' или 'register'
+$action = $isFirstUser ? 'bootstrap_admin' : ($_GET['action'] ?? 'login'); // 'login' или 'register'
 
 // Простые запрещенные пароли
 $botLink = getenv('TELEGRAM_BOT_LINK') ?: 'https://t.me/vinnienasta_bot';
@@ -37,7 +45,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     
     $formAction = $_POST['form_action'] ?? 'login';
     
-if ($formAction === 'register') {
+    if ($isFirstUser && $formAction === 'bootstrap_admin') {
+        $adminUser = trim($_POST['admin_username'] ?? '');
+        $adminPass = $_POST['admin_password'] ?? '';
+        if ($adminUser === '' || strlen($adminUser) < 3) {
+            $error = 'Логин не короче 3 символов';
+        } elseif (strlen($adminPass) < 8) {
+            $error = 'Пароль не короче 8 символов';
+        } else {
+            try {
+                $hash = password_hash($adminPass, PASSWORD_DEFAULT);
+                $stmt = $db->prepare('INSERT INTO users (username, password_hash, is_admin, active, verified) VALUES (?, ?, 1, 1, 1)');
+                $stmt->execute([$adminUser, $hash]);
+                session_regenerate_id(true);
+                $_SESSION['authenticated'] = true;
+                $_SESSION['username'] = $adminUser;
+                header('Location: /admin.php');
+                exit;
+            } catch (Throwable $e) {
+                $error = 'Не удалось создать администратора';
+            }
+        }
+    } elseif ($isFirstUser) {
+        $error = 'Создайте первого администратора';
+    } elseif ($formAction === 'register') {
         // Создаём запрос верификации через бота, без создания пользователя и без пароля
         $raw = $_POST['username'] ?? '';
         $username = normalizeTelegramLogin($raw);
@@ -304,6 +335,25 @@ $csrf = csrf_token();
             <div class="card">
                 <h1>Авторизация</h1>
                 
+                <?php if ($isFirstUser): ?>
+                    <p>База пуста. Создайте первого администратора для входа.</p>
+                    <?php if ($error): ?><div class='error'><?php echo htmlspecialchars($error); ?></div><?php endif; ?>
+                    <form method="POST" action="">
+                        <input type='hidden' name='redirect' value='<?php echo htmlspecialchars($redirect); ?>'>
+                        <input type='hidden' name='csrf_token' value='<?php echo htmlspecialchars($csrf); ?>'>
+                        <input type='hidden' name='form_action' value='bootstrap_admin'>
+                        <div class='form-group'>
+                            <label for='admin_username'>Логин администратора:</label>
+                            <input type='text' id='admin_username' name='admin_username' required minlength="3" autofocus autocomplete="username">
+                        </div>
+                        <div class='form-group'>
+                            <label for='admin_password'>Пароль (мин. 8 символов):</label>
+                            <input type='password' id='admin_password' name='admin_password' required minlength="8" autocomplete="new-password">
+                        </div>
+                        <button type='submit'>Создать администратора</button>
+                    </form>
+                <?php else: ?>
+                
                 <div class="tabs">
                     <button type="button" class="tab-btn <?php echo $action === 'login' ? 'active' : ''; ?>" onclick="showTab('login')">Вход</button>
                     <button type="button" class="tab-btn <?php echo $action === 'register' ? 'active' : ''; ?>" onclick="showTab('register')">Регистрация</button>
@@ -345,6 +395,7 @@ $csrf = csrf_token();
                         <button type='submit'>Верифицировать в боте</button>
                     </form>
                 </div>
+                <?php endif; ?>
             </div>
         </main>
     </div>
@@ -383,6 +434,7 @@ $csrf = csrf_token();
 
         // Проверка существования пользователя при вводе
         document.addEventListener('DOMContentLoaded', function() {
+            if (<?php echo $isFirstUser ? 'true' : 'false'; ?>) return;
             const regUserInput = document.getElementById('reg_username');
             const regUserHint = document.getElementById('reg_username_hint');
             let regUserTimer = null;
